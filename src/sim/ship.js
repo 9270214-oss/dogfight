@@ -1,6 +1,7 @@
 import { Entity } from './entity.js';
 import { Vector2 } from './vector.js';
 import { Bullet } from './bullet.js';
+import { emitGameEvent } from '../events.js';
 
 export class Ship extends Entity {
   #hp = 100;
@@ -45,7 +46,9 @@ export class Ship extends Entity {
 
     const bullet = new Bullet(bulletPos.x, bulletPos.y, bulletVel, this.id);
     world.spawn(bullet);
+    emitGameEvent('fired');
     return bullet;
+    
   };
 
   update(dt, world, inputs) {

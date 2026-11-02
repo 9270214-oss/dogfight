@@ -1,4 +1,5 @@
 import { Explosion } from './explosion.js';
+import { emitGameEvent } from '../events.js';
 
 export function checkCircleCollision(a, b) {
   const dx = a.pos.x - b.pos.x;
@@ -19,7 +20,7 @@ export function handleCollisions(world) {
       if (!a.alive || !b.alive) continue;
 
       if (checkCircleCollision(a, b)) {
-        // 1. Куля vs Астероїд
+        // 1. Куля влучає в астероїд
         if ((a.kind === 'bullet' && b.kind === 'asteroid') || (a.kind === 'asteroid' && b.kind === 'bullet')) {
           const bullet = a.kind === 'bullet' ? a : b;
           const asteroid = a.kind === 'asteroid' ? a : b;
@@ -28,9 +29,12 @@ export function handleCollisions(world) {
           asteroid.alive = false;
           world.score += 100;
           world.spawn(new Explosion(asteroid.pos.x, asteroid.pos.y));
+
+          // Відправляємо подію руйнування каменя
+          emitGameEvent('asteroidExploded');
         }
 
-        // 2. Корабель vs Астероїд
+        // 2. Корабель врізається в астероїд
         if ((a.kind === 'ship' && b.kind === 'asteroid') || (a.kind === 'asteroid' && b.kind === 'ship')) {
           const ship = a.kind === 'ship' ? a : b;
           const asteroid = a.kind === 'asteroid' ? a : b;
@@ -38,15 +42,19 @@ export function handleCollisions(world) {
           ship.takeDamage(50);
           asteroid.alive = false;
           world.spawn(new Explosion(asteroid.pos.x, asteroid.pos.y));
+
+          // Відправляємо подію руйнування/удару корабля
+          emitGameEvent('shipExploded');
         }
 
-        // 3. Корабель vs Бонус (Pickup)
+        // 3. Корабель підбирає бонус
         if ((a.kind === 'ship' && b.kind === 'pickup') || (a.kind === 'pickup' && b.kind === 'ship')) {
           const ship = a.kind === 'ship' ? a : b;
           const pickup = a.kind === 'pickup' ? a : b;
 
           if (pickup.type === 'heal') {
             ship.heal(40);
+            emitGameEvent('heal');
           }
           pickup.alive = false;
         }
