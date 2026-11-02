@@ -1,64 +1,105 @@
-import { createLoop } from "./loop.js";
-import { createInput } from "./input.js";
-import { integrate } from "./sim/ship.js";
-import { wrapAround } from "./sim/arena.js";
-import { createCanvas } from "./render/canvas.js";
-import { drawShip, drawStars, drawGrid } from "./render/draw.js";
+import { World } from './sim/world.js';
+import { Ship } from './sim/ship.js';
+import { Asteroid } from './sim/asteroid.js';
+import { Pickup } from './sim/pickup.js';
+import { HomingBehavior } from './sim/composition.js';
+import { handleCollisions } from './sim/collision.js';
 
-const canvas = document.querySelector("#game");
-const { context } = createCanvas(canvas);
-const input = createInput();
-const hud = document.createElement("div");
-hud.id = "hud";
-document.body.appendChild(hud);
+const canvas = document.getElementById('canvas') || document.querySelector('canvas');
+const ctx = canvas.getContext('2d');
 
-const ship = {
-  x: 400,
-  y: 300,
-  vx: 0,
-  vy: 0,
-  angle: 0,
-};
+const world = new World(window.innerWidth, window.innerHeight);
 
-const previousShip = { ...ship };
-
-function simulate(dt) {
-  Object.assign(previousShip, ship);
-
-  integrate(ship, input, dt);
-  wrapAround(ship, canvas.clientWidth, canvas.clientHeight);
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  world.width = canvas.width;
+  world.height = canvas.height;
+  if (world.generateStars) world.generateStars();
 }
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
 
-function render(alpha) {
-  context.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+const player = new Ship(world.width / 2, world.height / 2);
+world.spawn(player);
 
-  drawStars(context, canvas.clientWidth, canvas.clientHeight);
-  drawGrid(context, canvas.clientWidth, canvas.clientHeight);
-  const angleDifference =
-  Math.atan2(
-    Math.sin(ship.angle - previousShip.angle),
-    Math.cos(ship.angle - previousShip.angle),
-  );
-
-const renderShip = {
-  ...ship,
-  x: previousShip.x + (ship.x - previousShip.x) * alpha,
-  y: previousShip.y + (ship.y - previousShip.y) * alpha,
-  angle: previousShip.angle + angleDifference * alpha,
-};
-  
-drawShip(context, renderShip, input.isDown("ArrowUp"));
-
-  hud.textContent =
-    `steps/s: ${loop.stepsPerSecond.toFixed(0)} | ` +
-    `frames/s: ${loop.framesPerSecond.toFixed(0)} | ` +
-    `frame time: ${loop.frameTime.toFixed(2)} ms`;
-
-  input.endFrame();
+// Спавнимо 10 астероїдів
+function spawnAsteroids(count) {
+  for (let i = 0; i < count; i++) {
+    world.spawn(new Asteroid(Math.random() * world.width, Math.random() * world.height));
+  }
 }
+spawnAsteroids(10);
 
-const loop = createLoop({
-  step: 1 / 60,
-  simulate,
-  render,
+// Астероїд із самонаведенням
+const homingAsteroid = new Asteroid(100, 100);
+homingAsteroid.homingComponent = new HomingBehavior('ship', 1.2, 85);
+world.spawn(homingAsteroid);
+
+// Спавн першої аптечки
+world.spawn(new Pickup(Math.random() * (world.width - 100) + 50, Math.random() * (world.height - 100) + 50, 'heal'));
+
+const inputs = { left: false, right: false, thrust: false };
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') inputs.left = true;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') inputs.right = true;
+  if (e.code === 'ArrowUp' || e.code === 'KeyW') inputs.thrust = true;
+
+  if (e.code === 'Space') {
+    player.fire(world);
+  }
 });
+
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') inputs.left = false;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') inputs.right = false;
+  if (e.code === 'ArrowUp' || e.code === 'KeyW') inputs.thrust = false;
+});
+
+let respawnTimer = 0;
+let pickupTimer = 0;
+let lastTime = performance.now();
+
+function gameLoop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.1);
+  lastTime = now;
+
+  // Респаун гравця
+  if (!player.alive) {
+    respawnTimer += dt;
+    if (respawnTimer >= 2.0) {
+      player.respawn(world.width / 2, world.height / 2);
+      respawnTimer = 0;
+    }
+  }
+
+  // Підтримуємо постійну кількість астероїдів (якщо стало менше 6 — додаємо нові)
+  let currentAsteroids = 0;
+  for (const _ of world.ofKind('asteroid')) {
+    currentAsteroids++;
+  }
+  if (currentAsteroids < 6) {
+    spawnAsteroids(3);
+  }
+
+  // Періодична поява аптечок кожні 10 секунд
+  pickupTimer += dt;
+  if (pickupTimer >= 10.0) {
+    pickupTimer = 0;
+    world.spawn(new Pickup(
+      Math.random() * (world.width - 100) + 50,
+      Math.random() * (world.height - 100) + 50,
+      'heal'
+    ));
+  }
+
+  world.step(dt, inputs);
+  handleCollisions(world);
+
+  world.draw(ctx);
+
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
