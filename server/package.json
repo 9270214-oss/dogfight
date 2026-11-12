@@ -2,13 +2,18 @@
     "name": "dogfight-server",
     "version": "1.0.0",
     "type": "module",
-    "main": "src/index.js",
+    "main": "src/index.ts",
     "scripts": {
-      "dev": "node --watch src/index.js",
-      "start": "node src/index.js"
+      "dev": "node --watch src/index.ts",
+      "start": "node src/index.ts",
+      "typecheck": "tsc --noEmit -p ."
     },
     "dependencies": {
+      "shared": "file:../shared",
       "ws": "^8.16.0",
-      "shared": "file:../shared"
+      "zod": "^4.6.7"
+    },
+    "devDependencies": {
+      "@types/ws": "^8.18.2"
     }
   }
