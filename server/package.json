@@ -8,6 +8,7 @@
       "start": "node src/index.js"
     },
     "dependencies": {
-      "ws": "^8.16.0"
+      "ws": "^8.16.0",
+      "shared": "file:../shared"
     }
   }

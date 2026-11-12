@@ -1,31 +1,84 @@
+import {
+  MSG,
+  applyInput,
+  decodeWelcome,
+  encodeInput,
+  decodeSnapshot,
+  encodePing,
+  decodePing
+} from 'shared';
 import { World } from './sim/world.js';
 import { Ship } from './sim/ship.js';
 import { Asteroid } from './sim/asteroid.js';
 import { Pickup } from './sim/pickup.js';
 import { handleCollisions } from './sim/collision.js';
 import { ParticleSystem } from './render/particles.js';
-
 import { loadAll } from './assets/loader.js';
 import { drawLoadingScreen } from './render/loadingScreen.js';
 import { audioManager } from './audio/audio.js';
 import { showLobby } from './ui/lobby.js';
 
+const WORLD_WIDTH = 1200;
+const WORLD_HEIGHT = 800;
+const TICK_RATE = 30;
+const FIXED_DT = 1 / TICK_RATE;
+
 let myPlayerId = null;
+let myNetId = null;
+let worldSeed = 1337;
 let myScore = 0;
 let winScoreTarget = 100;
+
 const remotePlayers = new Map();
+const snapshotBuffer = [];
 let currentGameWorld = null;
 let localPlayerRef = null;
 let initialWorldState = null;
 let isWaveRequestPending = false;
 let isGameOver = false;
 
+// Стан Prediction, Reconciliation та візуального згладжування
+let predictionEnabled = true;
+let activeCodec = 'binary';
+let netemPreset = '0 ms';
+let interpDelayMs = 80;
+
+let inputSeq = 0;
+const pendingInputs = [];
+const predState = { x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2, angle: 0 };
+const smoothOffset = { x: 0, y: 0 };
+
+// Метрики для Netgraph
+const netStats = {
+  rttMs: 0,
+  lastSnapshotAt: performance.now(),
+  snapshotAgeMs: 0,
+  inBytesAcc: 0,
+  outBytesAcc: 0,
+  inBytesPerSec: 0,
+  outBytesPerSec: 0,
+  lastCorrectionPx: 0
+};
+
+const textEncoder = new TextEncoder();
+
+function wrapCoords(obj) {
+  if (obj.x < 0) obj.x += WORLD_WIDTH;
+  if (obj.x > WORLD_WIDTH) obj.x -= WORLD_WIDTH;
+  if (obj.y < 0) obj.y += WORLD_HEIGHT;
+  if (obj.y > WORLD_HEIGHT) obj.y -= WORLD_HEIGHT;
+}
+
+function lerpAngle(a0, a1, t) {
+  const twoPi = Math.PI * 2;
+  const diff = (((a1 - a0 + Math.PI) % twoPi) + twoPi) % twoPi - Math.PI;
+  return a0 + diff * t;
+}
+
 // VFX та Трясіння камери
 const particleSystem = new ParticleSystem();
 let shakeTimer = 0;
 let shakeIntensity = 0;
-
-// Трекер для відстеження знищення БУДЬ-ЯКОГО астероїда
 const trackedAsteroids = new Map();
 
 function triggerScreenShake(intensity = 6, duration = 0.25) {
@@ -33,13 +86,10 @@ function triggerScreenShake(intensity = 6, duration = 0.25) {
   shakeTimer = duration;
 }
 
-// Універсальна функція: гарантує вибух для кожного знищеного астероїда
 function updateAsteroidVFX() {
   if (!currentGameWorld || typeof currentGameWorld.ofKind !== 'function') return;
-
   const currentAsteroids = new Set(currentGameWorld.ofKind('asteroid') || []);
 
-  // 1. Перевіряємо астероїди, які зникли або загинули
   for (const [ast, pos] of trackedAsteroids.entries()) {
     if (!currentAsteroids.has(ast) || ast.alive === false) {
       if (!ast._explodedVFX) {
@@ -51,30 +101,178 @@ function updateAsteroidVFX() {
     }
   }
 
-  // 2. Оновлюємо останні координати живих астероїдів
   currentAsteroids.forEach((ast) => {
     if (ast.alive !== false && !ast._explodedVFX) {
-      const ax = ast.x ?? ast.pos?.x ?? ast.position?.x ?? 0;
-      const ay = ast.y ?? ast.pos?.y ?? ast.position?.y ?? 0;
+      const ax = ast.pos?.x ?? ast.x ?? 0;
+      const ay = ast.pos?.y ?? ast.y ?? 0;
       trackedAsteroids.set(ast, { x: ax, y: ay });
     }
   });
 }
 
 const socket = new WebSocket('ws://localhost:3000');
+socket.binaryType = 'arraybuffer';
+
+function sendPacket(data) {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  const bytes = data instanceof ArrayBuffer
+    ? data.byteLength
+    : textEncoder.encode(data).byteLength;
+  netStats.outBytesAcc += bytes;
+  socket.send(data);
+}
+
+setInterval(() => {
+  netStats.inBytesPerSec = netStats.inBytesAcc;
+  netStats.outBytesPerSec = netStats.outBytesAcc;
+  netStats.inBytesAcc = 0;
+  netStats.outBytesAcc = 0;
+}, 1000);
+
+setInterval(() => {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  const now = performance.now();
+  if (activeCodec === 'binary') {
+    sendPacket(encodePing(MSG.PING, now));
+  } else {
+    sendPacket(JSON.stringify({ type: 'PING', payload: now }));
+  }
+}, 500);
+
+function handleSnapshotData(snapshot) {
+  const now = performance.now();
+  netStats.lastSnapshotAt = now;
+
+  // Зберігаємо знімок у буфер для інтерполяції віддалених кораблів
+  const shipsMap = new Map();
+  for (const s of snapshot.ships) {
+    shipsMap.set(s.id, { x: s.x, y: s.y, angle: s.angle });
+  }
+  snapshotBuffer.push({ time: now, tick: snapshot.tick, ships: shipsMap });
+  while (snapshotBuffer.length > 30) {
+    snapshotBuffer.shift();
+  }
+
+  const activeNetIds = new Set();
+
+  for (const s of snapshot.ships) {
+    if (s.id === myNetId) {
+      while (pendingInputs.length > 0 && pendingInputs[0].seq <= s.lastSeq) {
+        pendingInputs.shift();
+      }
+
+      if (!predictionEnabled) {
+        // Режим M1 без передбачення: корабель рухається лише за знімками сервера
+        netStats.lastCorrectionPx = Math.hypot(s.x - predState.x, s.y - predState.y);
+        predState.x = s.x;
+        predState.y = s.y;
+        predState.angle = s.angle;
+        smoothOffset.x = 0;
+        smoothOffset.y = 0;
+        if (localPlayerRef && localPlayerRef.alive) {
+          localPlayerRef.pos.x = predState.x;
+          localPlayerRef.pos.y = predState.y;
+          localPlayerRef.angle = predState.angle;
+        }
+        continue;
+      }
+
+      // Режим M2: Server Reconciliation із повторним програванням непідтверджених команд
+      const beforeX = predState.x;
+      const beforeY = predState.y;
+
+      predState.x = s.x;
+      predState.y = s.y;
+      predState.angle = s.angle;
+
+      for (const item of pendingInputs) {
+        applyInput(predState, item.input, FIXED_DT);
+        wrapCoords(predState);
+      }
+
+      let errX = beforeX - predState.x;
+      let errY = beforeY - predState.y;
+      if (Math.abs(errX) > WORLD_WIDTH / 2) errX = 0;
+      if (Math.abs(errY) > WORLD_HEIGHT / 2) errY = 0;
+
+      const errMag = Math.hypot(errX, errY);
+      netStats.lastCorrectionPx = errMag;
+
+      if (errMag > 0.5 && errMag < 180) {
+        smoothOffset.x += errX;
+        smoothOffset.y += errY;
+      }
+    } else {
+      activeNetIds.add(s.id);
+      const strId = 'p_' + s.id;
+      if (!remotePlayers.has(strId)) {
+        remotePlayers.set(strId, {
+          id: strId,
+          netId: s.id,
+          x: s.x,
+          y: s.y,
+          angle: s.angle,
+          hp: 100,
+          score: 0
+        });
+      }
+    }
+  }
+
+  for (const [strId, p] of remotePlayers.entries()) {
+    if (typeof p.netId === 'number' && !activeNetIds.has(p.netId)) {
+      remotePlayers.delete(strId);
+    }
+  }
+}
 
 socket.addEventListener('open', () => {
   console.log('[WS Client] Підключено!');
 });
 
 socket.addEventListener('message', (event) => {
+  if (event.data instanceof ArrayBuffer) {
+    netStats.inBytesAcc += event.data.byteLength;
+    const view = new DataView(event.data);
+    if (view.byteLength < 2) return;
+    const msgType = view.getUint8(1);
+
+    if (msgType === MSG.WELCOME) {
+      const welcome = decodeWelcome(event.data);
+      myNetId = welcome.id;
+      worldSeed = welcome.seed;
+      return;
+    }
+
+    if (msgType === MSG.PONG) {
+      const pong = decodePing(event.data);
+      const sampleRtt = Math.max(0, performance.now() - pong.timestamp);
+      netStats.rttMs = netStats.rttMs === 0 ? sampleRtt : netStats.rttMs * 0.8 + sampleRtt * 0.2;
+      return;
+    }
+
+    if (msgType === MSG.SNAPSHOT) {
+      handleSnapshotData(decodeSnapshot(event.data));
+      return;
+    }
+  }
+
   try {
+    netStats.inBytesAcc += textEncoder.encode(event.data).byteLength;
     const { type, payload } = JSON.parse(event.data);
 
-    if (type === 'INIT_SELF') {
+    if (type === 'PONG') {
+      const sampleRtt = Math.max(0, performance.now() - Number(payload || 0));
+      netStats.rttMs = netStats.rttMs === 0 ? sampleRtt : netStats.rttMs * 0.8 + sampleRtt * 0.2;
+    } else if (type === 'SNAPSHOT') {
+      handleSnapshotData(payload);
+    } else if (type === 'INIT_SELF') {
       myPlayerId = payload.id;
+      if (payload.netId) myNetId = payload.netId;
+      if (payload.seed) worldSeed = payload.seed;
       if (payload.winScore) winScoreTarget = payload.winScore;
       if (payload.worldState) initialWorldState = payload.worldState;
+
       if (Array.isArray(payload.existingPlayers)) {
         payload.existingPlayers.forEach((p) => {
           remotePlayers.set(p.id, { hp: 100, score: 0, ...p });
@@ -82,9 +280,6 @@ socket.addEventListener('message', (event) => {
       }
     } else if (type === 'PLAYER_JOINED') {
       remotePlayers.set(payload.id, { hp: 100, score: 0, ...payload });
-    } else if (type === 'PLAYER_MOVED') {
-      const existing = remotePlayers.get(payload.id) || { hp: 100, score: 0 };
-      remotePlayers.set(payload.id, { ...existing, ...payload });
     } else if (type === 'PLAYER_DISCONNECTED') {
       remotePlayers.delete(payload.id);
     } else if (type === 'PLAYER_FIRE' && currentGameWorld && !isGameOver) {
@@ -94,7 +289,6 @@ socket.addEventListener('message', (event) => {
       if (audioManager.play) audioManager.play('laser');
     } else if (type === 'PLAYER_HIT') {
       triggerScreenShake(7, 0.2);
-
       if (payload.attackerId === myPlayerId) {
         myScore = payload.attackerScore;
       } else {
@@ -109,18 +303,8 @@ socket.addEventListener('message', (event) => {
       }
 
       if (payload.targetId === myPlayerId && localPlayerRef && localPlayerRef.alive) {
-        const px = localPlayerRef.x ?? localPlayerRef.pos?.x ?? (canvas.width / 2);
-        const py = localPlayerRef.y ?? localPlayerRef.pos?.y ?? (canvas.height / 2);
-        particleSystem.createExplosion(px, py, '#ff0055', 35);
-
-        if (typeof localPlayerRef.takeDamage === 'function') {
-          localPlayerRef.takeDamage(payload.damage || 20);
-        } else if (typeof localPlayerRef.hp === 'number') {
-          localPlayerRef.hp -= payload.damage || 20;
-          if (localPlayerRef.hp <= 0) localPlayerRef.alive = false;
-        } else {
-          localPlayerRef.alive = false;
-        }
+        particleSystem.createExplosion(localPlayerRef.pos.x, localPlayerRef.pos.y, '#ff0055', 35);
+        localPlayerRef.takeDamage(payload.damage || 20);
       }
     } else if (type === 'ASTEROID_DESTROYED') {
       if (payload.shooterId === myPlayerId) {
@@ -133,9 +317,7 @@ socket.addEventListener('message', (event) => {
       if (currentGameWorld && typeof currentGameWorld.ofKind === 'function') {
         const asteroids = Array.from(currentGameWorld.ofKind('asteroid') || []);
         const target = asteroids.find((a) => a.netId === payload.asteroidId);
-        if (target) {
-          target.alive = false;
-        }
+        if (target) target.alive = false;
       }
     } else if (type === 'NEW_WAVE' && currentGameWorld && !isGameOver) {
       isWaveRequestPending = false;
@@ -162,8 +344,8 @@ socket.addEventListener('message', (event) => {
         const pickups = Array.from(currentGameWorld.ofKind('pickup') || []);
         const target = pickups.find((p) => p.netId === payload.pickupId);
         if (target) {
-          const px = target.x ?? target.pos?.x ?? 0;
-          const py = target.y ?? target.pos?.y ?? 0;
+          const px = target.pos?.x ?? target.x ?? 0;
+          const py = target.pos?.y ?? target.y ?? 0;
           particleSystem.createPickupBurst(px, py);
           target.alive = false;
         }
@@ -213,7 +395,7 @@ function showGameOverModal(winnerId, winnerScore) {
       ${isMe ? '🏆 ВІТАЄМО! ВИ ПЕРЕМОГЛИ!' : '💥 МАТЧ ЗАВЕРШЕНО'}
     </h1>
     <p style="font-size: 1.4rem; margin-bottom: 20px;">
-      Переможець: <strong>${isMe ? 'Ви' : 'Гравець ' + winnerId.substring(0, 4)}</strong> з рахунком <strong>${winnerScore} pts</strong>
+      Переможець: <strong>${isMe ? 'Ви' : 'Гравець ' + winnerId}</strong> з рахунком <strong>${winnerScore} pts</strong>
     </p>
     <button id="btn-return-lobby" style="
       padding: 12px 30px; font-size: 1.2rem; font-weight: bold;
@@ -221,27 +403,59 @@ function showGameOverModal(winnerId, winnerScore) {
       cursor: pointer; transition: transform 0.2s;
     ">Повернутися у Лобі</button>
   `;
-
   modal.style.display = 'flex';
   document.getElementById('btn-return-lobby').onclick = () => {
     window.location.reload();
   };
 }
 
-async function init() {
-  drawLoadingScreen(ctx, canvas.width, canvas.height, 0, "Завантаження...");
+function interpolateRemoteEntities(now) {
+  if (snapshotBuffer.length === 0) return;
+  const renderTime = now - interpDelayMs;
 
+  let s0 = snapshotBuffer[0];
+  let s1 = snapshotBuffer[snapshotBuffer.length - 1];
+
+  for (let i = 0; i < snapshotBuffer.length - 1; i++) {
+    if (snapshotBuffer[i].time <= renderTime && snapshotBuffer[i + 1].time >= renderTime) {
+      s0 = snapshotBuffer[i];
+      s1 = snapshotBuffer[i + 1];
+      break;
+    }
+  }
+
+  const span = s1.time - s0.time;
+  const alpha = span > 0 ? Math.max(0, Math.min(1, (renderTime - s0.time) / span)) : 1;
+
+  remotePlayers.forEach((p) => {
+    if (typeof p.netId !== 'number') return;
+    const p1 = s1.ships.get(p.netId);
+    if (!p1) return;
+    const p0 = s0.ships.get(p.netId) || p1;
+
+    if (Math.abs(p1.x - p0.x) > WORLD_WIDTH / 2 || Math.abs(p1.y - p0.y) > WORLD_HEIGHT / 2) {
+      p.x = p1.x;
+      p.y = p1.y;
+    } else {
+      p.x = p0.x + (p1.x - p0.x) * alpha;
+      p.y = p0.y + (p1.y - p0.y) * alpha;
+    }
+    p.angle = lerpAngle(p0.angle, p1.angle, alpha);
+  });
+}
+
+async function init() {
+  drawLoadingScreen(ctx, canvas.width, canvas.height, 0, 'Завантаження...');
   try {
     const loadedAssets = await loadAll('/assets/manifest.json', {
       onProgress: (progress) => drawLoadingScreen(ctx, canvas.width, canvas.height, progress)
     });
-
-    drawLoadingScreen(ctx, canvas.width, canvas.height, 1, "Готово!");
+    drawLoadingScreen(ctx, canvas.width, canvas.height, 1, 'Готово!');
 
     const selectedRoom = await showLobby();
 
     const join = () => {
-      socket.send(JSON.stringify({
+      sendPacket(JSON.stringify({
         type: 'JOIN_ROOM',
         payload: { roomId: selectedRoom.id }
       }));
@@ -256,7 +470,6 @@ async function init() {
         startGame(loadedAssets, selectedRoom);
       }
     }, 50);
-
   } catch (err) {
     console.error('Помилка запуску:', err);
   }
@@ -264,15 +477,21 @@ async function init() {
 
 function startGame(assets, room) {
   audioManager.init(assets.audio);
-  const world = new World(canvas.width, canvas.height);
+  const world = new World(WORLD_WIDTH, WORLD_HEIGHT);
   currentGameWorld = world;
   isGameOver = false;
   myScore = 0;
   trackedAsteroids.clear();
 
-  const player = new Ship(world.width / 2, world.height / 2);
+  const player = new Ship(WORLD_WIDTH / 2, WORLD_HEIGHT / 2);
+  player.networkControlled = true;
   localPlayerRef = player;
   world.spawn(player);
+
+  predState.x = player.pos.x;
+  predState.y = player.pos.y;
+  predState.angle = player.angle;
+  pendingInputs.length = 0;
 
   if (initialWorldState && Array.isArray(initialWorldState.asteroids)) {
     initialWorldState.asteroids.forEach((ast) => {
@@ -292,7 +511,7 @@ function startGame(assets, room) {
     });
   }
 
-  const inputs = { left: false, right: false, thrust: false };
+  const inputs = { left: false, right: false, thrust: false, fire: false };
 
   window.addEventListener('keydown', (e) => {
     if (isGameOver) return;
@@ -301,19 +520,38 @@ function startGame(assets, room) {
     if (e.code === 'ArrowUp' || e.code === 'KeyW') inputs.thrust = true;
 
     if (e.code === 'Space' && player.alive) {
+      inputs.fire = true;
       player.fire(world);
       if (audioManager.play) audioManager.play('laser');
 
-      if (socket.readyState === WebSocket.OPEN) {
-        const posX = player.x ?? player.pos?.x ?? player.position?.x ?? (world.width / 2);
-        const posY = player.y ?? player.pos?.y ?? player.position?.y ?? (world.height / 2);
-        const angle = player.angle ?? player.rotation ?? 0;
+      sendPacket(JSON.stringify({
+        type: 'PLAYER_FIRE',
+        payload: { x: player.pos.x, y: player.pos.y, angle: player.angle }
+      }));
+    }
 
-        socket.send(JSON.stringify({
-          type: 'PLAYER_FIRE',
-          payload: { x: posX, y: posY, angle }
-        }));
-      }
+    // Клавіші керування мережевим стендом (Netem / Prediction / Codec / Interp)
+    if (e.code === 'Digit1') {
+      netemPreset = '0 ms';
+      sendPacket(JSON.stringify({ type: 'SET_NETEM', payload: { delay: 0, jitter: 0, loss: 0 } }));
+    } else if (e.code === 'Digit2') {
+      netemPreset = '100 ms';
+      sendPacket(JSON.stringify({ type: 'SET_NETEM', payload: { delay: 100, jitter: 0, loss: 0 } }));
+    } else if (e.code === 'Digit3') {
+      netemPreset = '100±30ms, 2%';
+      sendPacket(JSON.stringify({ type: 'SET_NETEM', payload: { delay: 100, jitter: 30, loss: 0.02 } }));
+    } else if (e.code === 'KeyP') {
+      predictionEnabled = !predictionEnabled;
+      pendingInputs.length = 0;
+      smoothOffset.x = 0;
+      smoothOffset.y = 0;
+    } else if (e.code === 'KeyB') {
+      activeCodec = activeCodec === 'binary' ? 'json' : 'binary';
+      sendPacket(JSON.stringify({ type: 'SET_CODEC', payload: { codec: activeCodec } }));
+    } else if (e.code === 'BracketLeft') {
+      interpDelayMs = Math.max(33, interpDelayMs - 15);
+    } else if (e.code === 'BracketRight') {
+      interpDelayMs = Math.min(200, interpDelayMs + 15);
     }
   });
 
@@ -321,37 +559,86 @@ function startGame(assets, room) {
     if (e.code === 'ArrowLeft' || e.code === 'KeyA') inputs.left = false;
     if (e.code === 'ArrowRight' || e.code === 'KeyD') inputs.right = false;
     if (e.code === 'ArrowUp' || e.code === 'KeyW') inputs.thrust = false;
+    if (e.code === 'Space') inputs.fire = false;
   });
 
   let respawnTimer = 0;
+  let tickAccumulator = 0;
   let lastTime = performance.now();
 
   function gameLoop(now) {
     const dt = Math.min((now - lastTime) / 1000, 0.1);
     lastTime = now;
+    netStats.snapshotAgeMs = now - netStats.lastSnapshotAt;
 
     if (!isGameOver) {
       if (!player.alive) {
         respawnTimer += dt;
         if (respawnTimer >= 2.0) {
-          player.respawn(world.width / 2, world.height / 2);
-          if (typeof player.hp !== 'undefined') player.hp = 100;
+          player.respawn(WORLD_WIDTH / 2, WORLD_HEIGHT / 2);
+          predState.x = WORLD_WIDTH / 2;
+          predState.y = WORLD_HEIGHT / 2;
+          predState.angle = 0;
+          smoothOffset.x = 0;
+          smoothOffset.y = 0;
+          pendingInputs.length = 0;
           respawnTimer = 0;
         }
       }
 
+      // ФІКСОВАНИЙ 30Hz КРОК СИМУЛЯЦІЇ ТА ВІДПРАВКИ INPUT
+      tickAccumulator += dt;
+      while (tickAccumulator >= FIXED_DT) {
+        tickAccumulator -= FIXED_DT;
+
+        if (player.alive) {
+          const turn = (inputs.right ? 1 : 0) - (inputs.left ? 1 : 0);
+          const cmd = {
+            turn,
+            thrust: !!inputs.thrust,
+            fire: !!inputs.fire
+          };
+          const seq = ++inputSeq;
+
+          if (predictionEnabled) {
+            applyInput(predState, cmd, FIXED_DT);
+            wrapCoords(predState);
+            pendingInputs.push({ seq, input: cmd });
+            if (pendingInputs.length > 120) pendingInputs.shift();
+          }
+
+          if (activeCodec === 'binary') {
+            sendPacket(encodeInput(seq, cmd));
+          } else {
+            sendPacket(JSON.stringify({ type: 'INPUT', payload: { seq, ...cmd } }));
+          }
+        }
+      }
+
+      // Згладжування поправки reconciliation за ~100 мс
+      const decay = Math.exp(-dt * 25);
+      smoothOffset.x *= decay;
+      smoothOffset.y *= decay;
+
+      if (player.alive) {
+        player.pos.x = predState.x + smoothOffset.x;
+        player.pos.y = predState.y + smoothOffset.y;
+        player.angle = predState.angle;
+        wrapCoords(player.pos);
+      }
+
+      // Інтерполяція віддалених кораблів у минулому (now - interpDelayMs)
+      interpolateRemoteEntities(now);
+
       if (inputs.thrust && player.alive) {
-        const px = player.x ?? player.pos?.x ?? player.position?.x ?? 0;
-        const py = player.y ?? player.pos?.y ?? player.position?.y ?? 0;
-        const angle = player.angle ?? player.rotation ?? 0;
-        particleSystem.createThruster(px, py, angle);
+        particleSystem.createThruster(player.pos.x, player.pos.y, player.angle);
       }
 
       if (typeof world.ofKind === 'function') {
         const activeAsteroids = Array.from(world.ofKind('asteroid') || []).filter((a) => a.alive !== false);
         if (activeAsteroids.length === 0 && !isWaveRequestPending && socket.readyState === WebSocket.OPEN) {
           isWaveRequestPending = true;
-          socket.send(JSON.stringify({ type: 'REQUEST_NEW_WAVE' }));
+          sendPacket(JSON.stringify({ type: 'REQUEST_NEW_WAVE' }));
         }
       }
 
@@ -360,21 +647,16 @@ function startGame(assets, room) {
         const asteroids = Array.from(world.ofKind('asteroid') || []).filter((a) => a.alive !== false);
         const pickups = Array.from(world.ofKind('pickup') || []).filter((p) => p.alive !== false);
 
-        const px = player.x ?? player.pos?.x ?? player.position?.x ?? 0;
-        const py = player.y ?? player.pos?.y ?? player.position?.y ?? 0;
-
         pickups.forEach((pik) => {
-          const pikX = pik.x ?? pik.pos?.x ?? pik.position?.x;
-          const pikY = pik.y ?? pik.pos?.y ?? pik.position?.y;
-
+          const pikX = pik.pos?.x ?? pik.x;
+          const pikY = pik.pos?.y ?? pik.y;
           if (typeof pikX === 'number' && typeof pikY === 'number') {
-            if (Math.hypot(px - pikX, py - pikY) < 30) {
+            if (Math.hypot(player.pos.x - pikX, player.pos.y - pikY) < 30) {
               pik.alive = false;
               particleSystem.createPickupBurst(pikX, pikY);
-              if (typeof player.hp === 'number') player.hp = Math.min(100, player.hp + 30);
-
-              if (socket.readyState === WebSocket.OPEN && pik.netId) {
-                socket.send(JSON.stringify({
+              player.heal(30);
+              if (pik.netId) {
+                sendPacket(JSON.stringify({
                   type: 'PICKUP_COLLECTED',
                   payload: { pickupId: pik.netId }
                 }));
@@ -384,23 +666,19 @@ function startGame(assets, room) {
         });
 
         bullets.forEach((bullet) => {
-          const bx = bullet.x ?? bullet.pos?.x ?? bullet.position?.x;
-          const by = bullet.y ?? bullet.pos?.y ?? bullet.position?.y;
-
+          const bx = bullet.pos?.x ?? bullet.x;
+          const by = bullet.pos?.y ?? bullet.y;
           if (typeof bx === 'number' && typeof by === 'number') {
             asteroids.forEach((ast) => {
               if (ast.alive === false) return;
-              const ax = ast.x ?? ast.pos?.x ?? ast.position?.x;
-              const ay = ast.y ?? ast.pos?.y ?? ast.position?.y;
-
+              const ax = ast.pos?.x ?? ast.x;
+              const ay = ast.pos?.y ?? ast.y;
               if (typeof ax === 'number' && typeof ay === 'number') {
-                const dist = Math.hypot(bx - ax, by - ay);
-                if (dist < 32) {
+                if (Math.hypot(bx - ax, by - ay) < 32) {
                   bullet.alive = false;
                   ast.alive = false;
-
-                  if (socket.readyState === WebSocket.OPEN && ast.netId) {
-                    socket.send(JSON.stringify({
+                  if (ast.netId) {
+                    sendPacket(JSON.stringify({
                       type: 'ASTEROID_DESTROYED',
                       payload: { asteroidId: ast.netId }
                     }));
@@ -412,17 +690,12 @@ function startGame(assets, room) {
             remotePlayers.forEach((remoteP, remoteId) => {
               const rx = remoteP.x ?? 0;
               const ry = remoteP.y ?? 0;
-              const dist = Math.hypot(bx - rx, by - ry);
-
-              if (dist < 25 && bullet.alive !== false) {
+              if (Math.hypot(bx - rx, by - ry) < 25 && bullet.alive !== false) {
                 bullet.alive = false;
-
-                if (socket.readyState === WebSocket.OPEN) {
-                  socket.send(JSON.stringify({
-                    type: 'PLAYER_HIT',
-                    payload: { targetId: remoteId, damage: 25 }
-                  }));
-                }
+                sendPacket(JSON.stringify({
+                  type: 'PLAYER_HIT',
+                  payload: { targetId: remoteId, damage: 25 }
+                }));
               }
             });
           }
@@ -431,29 +704,21 @@ function startGame(assets, room) {
 
       world.step(dt, inputs);
       handleCollisions(world);
-
-      // ГАРАНТОВАНИЙ ВИКЛИК СПЕЦЕФЕКТІВ ДЛЯ УСІХ ЗНИЩЕНИХ АСТЕРОЇДІВ
       updateAsteroidVFX();
       particleSystem.update(dt);
-
-      if (socket.readyState === WebSocket.OPEN && player.alive) {
-        const posX = player.x ?? player.pos?.x ?? player.position?.x ?? (world.width / 2);
-        const posY = player.y ?? player.pos?.y ?? player.position?.y ?? (world.height / 2);
-        const angle = player.angle ?? player.rotation ?? 0;
-
-        socket.send(JSON.stringify({
-          type: 'PLAYER_STATE',
-          payload: { x: posX, y: posY, angle, hp: player.hp ?? 100 }
-        }));
-      }
     }
 
+    // РЕНДЕР СВІТУ З МАСШТАБУВАННЯМ ПІД РОЗМІР ВІКНА
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();
+    ctx.scale(canvas.width / WORLD_WIDTH, canvas.height / WORLD_HEIGHT);
+
     if (shakeTimer > 0) {
       shakeTimer -= dt;
-      const offsetX = (Math.random() - 0.5) * shakeIntensity;
-      const offsetY = (Math.random() - 0.5) * shakeIntensity;
-      ctx.translate(offsetX, offsetY);
+      ctx.translate(
+        (Math.random() - 0.5) * shakeIntensity,
+        (Math.random() - 0.5) * shakeIntensity
+      );
     }
 
     world.draw(ctx);
@@ -467,7 +732,6 @@ function startGame(assets, room) {
       ctx.save();
       ctx.translate(posX, posY);
       ctx.rotate(p.angle || 0);
-
       ctx.strokeStyle = '#ff9900';
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -477,7 +741,6 @@ function startGame(assets, room) {
       ctx.lineTo(-10, 10);
       ctx.closePath();
       ctx.stroke();
-
       ctx.restore();
 
       ctx.save();
@@ -490,32 +753,58 @@ function startGame(assets, room) {
 
     ctx.restore();
 
+    // NETGRAPH OVERLAY (МЕРЕЖЕВА ДІАГНОСТИКА)
     ctx.save();
-    ctx.fillStyle = '#00ffcc';
-    ctx.font = '16px sans-serif';
-    ctx.fillText(`Кімната: ${room ? room.name : 'Локальна'} | Гравців: ${remotePlayers.size + 1}`, 20, 30);
+    ctx.fillStyle = 'rgba(0, 12, 20, 0.78)';
+    ctx.fillRect(14, 14, 305, 195);
+    ctx.strokeStyle = '#00ffcc';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(14, 14, 305, 195);
 
+    ctx.fillStyle = '#00ffcc';
+    ctx.font = 'bold 13px monospace';
+    ctx.fillText(`NETGRAPH | ${room ? room.name : 'Арена'} | Seed: ${worldSeed}`, 24, 34);
+
+    ctx.font = '12px monospace';
+    ctx.fillStyle = '#e0f7fa';
+    ctx.fillText(`RTT (Ping):        ${netStats.rttMs.toFixed(1)} ms`, 24, 54);
+    ctx.fillText(`Вік знімка:        ${netStats.snapshotAgeMs.toFixed(0)} ms`, 24, 72);
+    ctx.fillText(`Трафік In / Out:   ${netStats.inBytesPerSec} / ${netStats.outBytesPerSec} B/s`, 24, 90);
+    ctx.fillText(`Черга input:       ${pendingInputs.length} пак.`, 24, 108);
+    ctx.fillText(`Поправка (Reconc): ${netStats.lastCorrectionPx.toFixed(2)} px`, 24, 126);
+    ctx.fillText(`Інтерполяція ([/]):${interpDelayMs} ms`, 24, 144);
+
+    ctx.fillStyle = predictionEnabled ? '#00ff66' : '#ff5555';
+    ctx.fillText(`[P] Prediction: ${predictionEnabled ? 'ON' : 'OFF'} | [B] ${activeCodec.toUpperCase()}`, 24, 166);
+    ctx.fillStyle = '#ffd54f';
+    ctx.fillText(`[1/2/3] Netem: ${netemPreset}`, 24, 184);
+    ctx.fillStyle = '#90a4ae';
+    ctx.font = '11px monospace';
+    ctx.fillText(`1:0ms | 2:100ms | 3:100±30ms+2%`, 24, 200);
+    ctx.restore();
+
+    // ТАБЛИЦЯ ОЧОК
+    ctx.save();
     const boardX = canvas.width - 240;
     ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    ctx.fillRect(boardX - 10, 10, 230, 45 + (remotePlayers.size * 20));
+    ctx.fillRect(boardX - 10, 14, 230, 45 + (remotePlayers.size * 20));
     ctx.strokeStyle = '#00ffcc';
-    ctx.strokeRect(boardX - 10, 10, 230, 45 + (remotePlayers.size * 20));
+    ctx.strokeRect(boardX - 10, 14, 230, 45 + (remotePlayers.size * 20));
 
     ctx.fillStyle = '#00ffcc';
     ctx.font = 'bold 13px sans-serif';
-    ctx.fillText(`ТАБЛИЦЯ ОЧОК (Ціль: ${winScoreTarget})`, boardX, 28);
+    ctx.fillText(`ТАБЛИЦЯ ОЧОК (Ціль: ${winScoreTarget})`, boardX, 32);
 
     ctx.font = '13px sans-serif';
     ctx.fillStyle = '#00ff00';
-    ctx.fillText(`Ви (${myPlayerId || 'Me'}): ${myScore} pts`, boardX, 48);
+    ctx.fillText(`Ви (${myPlayerId || 'Me'}): ${myScore} pts`, boardX, 52);
 
-    let lineOffset = 66;
+    let lineOffset = 70;
     remotePlayers.forEach((p, id) => {
       ctx.fillStyle = '#ff9900';
-      ctx.fillText(`Гравець ${id.substring(0, 4)}: ${p.score || 0} pts`, boardX, lineOffset);
+      ctx.fillText(`Гравець ${id}: ${p.score || 0} pts`, boardX, lineOffset);
       lineOffset += 18;
     });
-
     ctx.restore();
 
     requestAnimationFrame(gameLoop);
