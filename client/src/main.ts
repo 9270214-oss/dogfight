@@ -90,6 +90,11 @@ interface InitialWorldDto {
   pickups?: PickupDto[];
 }
 
+interface ChatEntry {
+  senderId: string;
+  text: string;
+}
+
 let myPlayerId: string | null = null;
 let myNetId: EntityId | null = null;
 let worldSeed = 1337;
@@ -99,6 +104,7 @@ let currentRoomId: string | null = null;
 
 const remotePlayers = new Map<string, RemotePlayerState>();
 const snapshotBuffer: SnapshotEntry[] = [];
+const chatMessages: ChatEntry[] = [];
 let currentGameWorld: World | null = null;
 let localPlayerRef: Ship | null = null;
 let initialWorldState: InitialWorldDto | null = null;
@@ -128,6 +134,23 @@ const netStats: NetStats = {
 };
 
 const textEncoder = new TextEncoder();
+let socket: WebSocket | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+function appendChatMessage(senderId: string, text: string): void {
+  chatMessages.push({ senderId, text });
+  if (chatMessages.length > 50) {
+    chatMessages.shift();
+  }
+  const listEl = document.getElementById('chat-messages');
+  if (!listEl) return;
+  const line = document.createElement('div');
+  line.style.marginBottom = '4px';
+  const authorLabel = senderId === myPlayerId ? 'Ви' : senderId;
+  line.textContent = `[${authorLabel}]: ${text}`;
+  listEl.appendChild(line);
+  listEl.scrollTop = listEl.scrollHeight;
+}
 
 function isSeqAcked(seq: number, ackSeq: number): boolean {
   const diff = ((ackSeq & 0xff) - (seq & 0xff) + 256) % 256;
@@ -228,27 +251,20 @@ function updateAsteroidVFX(): void {
   const currentAsteroids = new Set<Asteroid>(currentGameWorld.ofKind<Asteroid>('asteroid'));
   for (const [ast, info] of trackedAsteroids.entries()) {
     if (!currentAsteroids.has(ast) || !ast.alive) {
-      if (!ast._explodedVFX) {
-        ast._explodedVFX = true;
-        particleSystem.createExplosion(info.x, info.y, info.isHoming ? '#ff5500' : '#00ffcc', 28);
-        triggerScreenShake(5, 0.18);
-      }
+      particleSystem.createExplosion(info.x, info.y, info.isHoming ? '#ff5500' : '#ffaa00', 22);
       trackedAsteroids.delete(ast);
     }
   }
-  currentAsteroids.forEach((ast) => {
-    if (ast.alive && !ast._explodedVFX) {
+  for (const ast of currentAsteroids) {
+    if (ast.alive) {
       trackedAsteroids.set(ast, {
         x: ast.pos.x,
         y: ast.pos.y,
         isHoming: Boolean(ast.homingComponent)
       });
     }
-  });
+  }
 }
-
-let socket: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sendPacket(data: string | ArrayBuffer): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
@@ -398,7 +414,12 @@ function connectSocket(): void {
 
     try {
       netStats.inBytesAcc += textEncoder.encode(event.data).byteLength;
-      const raw = JSON.parse(event.data) as { type: string; payload?: unknown; tick?: number; ships?: SnapshotPacket['ships'] };
+      const raw = JSON.parse(event.data) as {
+        type: string;
+        payload?: unknown;
+        tick?: number;
+        ships?: SnapshotPacket['ships'];
+      };
       const { type } = raw;
 
       if (type === 'PONG') {
@@ -407,6 +428,9 @@ function connectSocket(): void {
       } else if (type === 'SNAPSHOT') {
         const snap = (raw.payload ?? raw) as SnapshotPacket;
         handleSnapshotData(snap);
+      } else if (type === 'CHAT') {
+        const payload = raw.payload as { senderId: string; text: string };
+        appendChatMessage(payload.senderId, payload.text);
       } else if (type === 'INIT_SELF') {
         const payload = raw.payload as {
           id: string;
@@ -596,6 +620,91 @@ function resizeCanvas(): void {
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
+function createInGameOverlays(): { updatePlayersHud: () => void } {
+  let chatPanel = document.getElementById('chat-panel');
+  if (!chatPanel) {
+    chatPanel = document.createElement('div');
+    chatPanel.id = 'chat-panel';
+    chatPanel.style.cssText = `
+      position: fixed; left: 14px; bottom: 14px; width: 305px;
+      background: rgba(0, 12, 20, 0.82); border: 1px solid #00ffcc;
+      border-radius: 6px; padding: 8px; z-index: 500;
+      font-family: monospace; font-size: 12px; color: #e0f7fa;
+    `;
+    chatPanel.innerHTML = `
+      <div style="font-weight: bold; color: #00ffcc; margin-bottom: 4px;">ЧАТ КІМНАТИ</div>
+      <div id="chat-messages" data-testid="chat-messages" style="height: 84px; overflow-y: auto; margin-bottom: 6px; padding-right: 4px;"></div>
+      <div style="display: flex; gap: 4px;">
+        <input id="chat-input" data-testid="chat-input" type="text" maxlength="200" placeholder="Повідомлення..." style="
+          flex: 1; background: rgba(0, 0, 0, 0.6); color: #fff;
+          border: 1px solid #00ffcc; border-radius: 4px; padding: 4px 6px; font-size: 12px;
+        " />
+        <button id="chat-send" data-testid="chat-send" type="button" style="
+          background: #00ffcc; color: #000; font-weight: bold;
+          border: none; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px;
+        ">OK</button>
+      </div>
+    `;
+    document.body.appendChild(chatPanel);
+
+    for (const entry of chatMessages) {
+      appendChatMessage(entry.senderId, entry.text);
+    }
+
+    const inputEl = document.getElementById('chat-input') as HTMLInputElement | null;
+    const sendBtn = document.getElementById('chat-send');
+
+    const submitChat = (): void => {
+      if (!inputEl) return;
+      const text = inputEl.value.trim();
+      if (!text) return;
+      sendPacket(JSON.stringify({ type: 'CHAT', payload: { text } }));
+      inputEl.value = '';
+    };
+
+    sendBtn?.addEventListener('click', submitChat);
+    inputEl?.addEventListener('keydown', (ev: KeyboardEvent) => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        submitChat();
+      }
+    });
+  }
+
+  let playersHud = document.getElementById('players-hud');
+  if (!playersHud) {
+    playersHud = document.createElement('div');
+    playersHud.id = 'players-hud';
+    playersHud.dataset.testid = 'players-hud';
+    playersHud.style.cssText = `
+      position: fixed; right: 14px; bottom: 14px; width: 240px;
+      background: rgba(0, 12, 20, 0.82); border: 1px solid #00ffcc;
+      border-radius: 6px; padding: 8px; z-index: 500;
+      font-family: monospace; font-size: 11px; color: #e0f7fa;
+    `;
+    document.body.appendChild(playersHud);
+  }
+
+  return {
+    updatePlayersHud(): void {
+      if (!playersHud) return;
+      const lines: string[] = [];
+      if (localPlayerRef) {
+        lines.push(
+          `<div>• <strong>${myPlayerId ?? 'Ви'}</strong> (Ви): (${Math.round(localPlayerRef.pos.x)}, ${Math.round(localPlayerRef.pos.y)})</div>`
+        );
+      }
+      remotePlayers.forEach((p) => {
+        lines.push(
+          `<div data-testid="remote-player-${p.id}">• ${p.id}: (${Math.round(p.x)}, ${Math.round(p.y)})</div>`
+        );
+      });
+      playersHud.innerHTML = `<div style="font-weight:bold;color:#00ffcc;margin-bottom:4px;">ГРАВЦІ У КІМНАТІ (${1 + remotePlayers.size})</div>${lines.join('')}`;
+    }
+  };
+}
+
 function showGameOverModal(winnerId: string, winnerScore: number): void {
   let modal = document.getElementById('game-over-modal');
   if (!modal) {
@@ -612,7 +721,7 @@ function showGameOverModal(winnerId: string, winnerScore: number): void {
   const isMe = winnerId === myPlayerId;
   modal.innerHTML = `
     <h1 style="font-size: 3rem; margin-bottom: 10px; color: ${isMe ? '#00ff00' : '#ff3366'};">
-      ${isMe ? '🏆 ВІТАЄМО! ВИ ПЕРЕМОГЛИ!' : '💥 МАТЧ ЗАВЕРШЕНО'}
+      ${isMe ? 'ВІТАЄМО! ВИ ПЕРЕМОГЛИ! МАТЧ ЗАВЕРШЕНО' : 'МАТЧ ЗАВЕРШЕНО'}
     </h1>
     <p style="font-size: 1.4rem; margin-bottom: 20px;">
       Переможець: <strong>${isMe ? 'Ви' : 'Гравець ' + winnerId}</strong> з рахунком <strong>${winnerScore} pts</strong>
@@ -707,6 +816,7 @@ async function init(): Promise<void> {
 
 function startGame(assets: LoadedAssets, room: RoomDto): void {
   audioManager.init(assets.audio);
+  const overlays = createInGameOverlays();
 
   const world = new World(WORLD_WIDTH, WORLD_HEIGHT);
   currentGameWorld = world;
@@ -767,6 +877,10 @@ function startGame(assets: LoadedAssets, room: RoomDto): void {
   });
 
   window.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement) {
+      return;
+    }
+
     if (
       e.code === 'Space' ||
       e.code === 'ArrowUp' ||
@@ -985,6 +1099,8 @@ function startGame(assets: LoadedAssets, room: RoomDto): void {
       updateAsteroidVFX();
       particleSystem.update(dt);
     }
+
+    overlays.updatePlayersHud();
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();

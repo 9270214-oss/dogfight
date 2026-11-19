@@ -98,6 +98,12 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
     payload: z.object({
       pickupId: z.string().min(1)
     })
+  }),
+  z.object({
+    type: z.literal('CHAT'),
+    payload: z.object({
+      text: z.string().min(1).max(200)
+    })
   })
 ]);
 
@@ -222,6 +228,13 @@ export const ServerMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('PONG'),
     payload: z.number().finite()
+  }),
+  z.object({
+    type: z.literal('CHAT'),
+    payload: z.object({
+      senderId: z.string(),
+      text: z.string()
+    })
   })
 ]);
 
@@ -233,7 +246,6 @@ export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 
 export function parseClientMessage(raw: unknown): Result<ClientMessage> {
   let parsedJson: unknown = raw;
-
   if (typeof raw === 'string') {
     try {
       parsedJson = JSON.parse(raw);
@@ -241,19 +253,16 @@ export function parseClientMessage(raw: unknown): Result<ClientMessage> {
       return { ok: false, error: 'Некоректний синтаксис JSON' };
     }
   }
-
   const res = ClientMessageSchema.safeParse(parsedJson);
   if (!res.success) {
     const details = res.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
     return { ok: false, error: details };
   }
-
   return { ok: true, value: res.data };
 }
 
 export function parseServerMessage(raw: unknown): Result<ServerMessage> {
   let parsedJson: unknown = raw;
-
   if (typeof raw === 'string') {
     try {
       parsedJson = JSON.parse(raw);
@@ -261,13 +270,11 @@ export function parseServerMessage(raw: unknown): Result<ServerMessage> {
       return { ok: false, error: 'Некоректний синтаксис JSON від сервера' };
     }
   }
-
   const res = ServerMessageSchema.safeParse(parsedJson);
   if (!res.success) {
     const details = res.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
     return { ok: false, error: details };
   }
-
   return { ok: true, value: res.data };
 }
 
@@ -304,7 +311,7 @@ export interface PingPacket {
 
 function assertHeader(view: DataView, expectedType: BinaryMsgType, minBytes: number): void {
   if (view.byteLength < minBytes) {
-    throw new RangeError(`Пакет занадто короткий: отримано ${view.byteLength} Б, очікувалось >= ${minBytes} Б`);
+    throw new RangeError(`Пакет занадто короткий: отримано ${view.byteLength} Б, очікувалося >= ${minBytes} Б`);
   }
   const version = view.getUint8(0);
   if (version !== PROTOCOL_VERSION) {
@@ -377,7 +384,6 @@ export function encodeSnapshot(tick: Tick, ships: readonly SnapshotShipState[]):
   view.setUint8(1, MSG.SNAPSHOT);
   view.setUint32(2, tick >>> 0, true);
   view.setUint8(6, ships.length);
-
   let offset = 7;
   for (const ship of ships) {
     view.setUint16(offset, ship.id, true);
@@ -388,7 +394,6 @@ export function encodeSnapshot(tick: Tick, ships: readonly SnapshotShipState[]):
     view.setInt16(offset + 14, quantizedAngle, true);
     offset += 16;
   }
-
   return buf;
 }
 
@@ -399,9 +404,8 @@ export function decodeSnapshot(buf: ArrayBuffer): SnapshotPacket {
   const count = view.getUint8(6);
   const expectedSize = 7 + count * 16;
   if (view.byteLength < expectedSize) {
-    throw new RangeError(`Пошкоджений знімок: очікувалось ${expectedSize} Б, отримано ${view.byteLength} Б`);
+    throw new RangeError(`Пошкоджений знімок: очікувалося ${expectedSize} Б, отримано ${view.byteLength} Б`);
   }
-
   const ships: SnapshotShipState[] = [];
   let offset = 7;
   for (let i = 0; i < count; i++) {
@@ -416,7 +420,6 @@ export function decodeSnapshot(buf: ArrayBuffer): SnapshotPacket {
     ships.push({ id, lastSeq, x, y, angle });
     offset += 16;
   }
-
   return { tick, ships };
 }
 

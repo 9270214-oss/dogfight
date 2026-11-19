@@ -605,6 +605,19 @@ function handleClientMessage(player: PlayerState, rawData: RawData, isBinary: bo
       break;
     }
 
+    case 'CHAT': {
+      if (player.roomId) {
+        sendToRoom(player.roomId, {
+          type: 'CHAT',
+          payload: {
+            senderId: player.id,
+            text: msg.payload.text
+          }
+        });
+      }
+      break;
+    }
+
     default:
       assertNever(msg);
   }
